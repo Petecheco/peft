@@ -60,6 +60,7 @@ from .vblora import VBLoRAConfig, VBLoRAModel
 from .vera import VeraConfig, VeraModel
 from .waveft import WaveFTConfig, WaveFTModel
 from .xlora import XLoraConfig, XLoraModel
+from .timelora import TimeLoraConfig, TimeLoraModel
 
 
 __all__ = [

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import torch
+from contextlib import contextmanager
 
 from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer
 from peft.utils import (
@@ -61,6 +62,34 @@ class TimeLoraModel(BaseTuner):
     tuner_layer_cls = TimeLoraLayer
     target_module_mapping = TRANSFORMERS_MODELS_TO_TIMELORA_TARGET_MODULES_MAPPING
 
+    def __init__(self, model, config, adapter_name, **kwargs):
+        super().__init__(model, config, adapter_name, **kwargs)
+        self._timestep_storage = None
+        
+        # Set reference in all TimeLora layers
+        for module in self.model.modules():
+            if isinstance(module, TimeLoraLinear):
+                module._timelora_model = self
+
+    @contextmanager
+    def _enable_peft_forward_hooks(self, *args, **kwargs):
+        """
+        Context manager for handling timestep parameter in forward pass.
+        This is called by PeftModel.forward() before calling the base model.
+        """
+        # Extract timestep from kwargs
+        timestep = kwargs.get('timestep', None)
+        
+        # Store timestep for layers to access
+        old_timestep = self._timestep_storage
+        self._timestep_storage = timestep
+        
+        try:
+            yield
+        finally:
+            # Restore previous timestep
+            self._timestep_storage = old_timestep
+
     def _check_new_adapter_config(self, config: TimeLoraConfig) -> None:
         """
         A helper method to check the config when a new adapter is being added.
@@ -87,6 +116,7 @@ class TimeLoraModel(BaseTuner):
         lora_dropout = timelora_config.lora_dropout
         time_embedding_dim = timelora_config.time_embedding_dim
         init_lora_weights = timelora_config.init_lora_weights
+        inference_mode = timelora_config.inference_mode
 
         kwargs = {
             "r": r,
@@ -94,6 +124,7 @@ class TimeLoraModel(BaseTuner):
             "lora_dropout": lora_dropout,
             "time_embedding_dim": time_embedding_dim,
             "init_lora_weights": init_lora_weights,
+            "inference_mode": inference_mode,
         }
 
         if isinstance(target, TimeLoraLinear):
