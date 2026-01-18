@@ -64,31 +64,6 @@ class TimeLoraModel(BaseTuner):
 
     def __init__(self, model, config, adapter_name, **kwargs):
         super().__init__(model, config, adapter_name, **kwargs)
-        self._timestep_storage = None
-        
-        # Set reference in all TimeLora layers
-        for module in self.model.modules():
-            if isinstance(module, TimeLoraLinear):
-                module._timelora_model = self
-
-    @contextmanager
-    def _enable_peft_forward_hooks(self, *args, **kwargs):
-        """
-        Context manager for handling timestep parameter in forward pass.
-        This is called by PeftModel.forward() before calling the base model.
-        """
-        # Extract timestep from kwargs
-        timestep = kwargs.get('timestep', None)
-        
-        # Store timestep for layers to access
-        old_timestep = self._timestep_storage
-        self._timestep_storage = timestep
-        
-        try:
-            yield
-        finally:
-            # Restore previous timestep
-            self._timestep_storage = old_timestep
 
     def _check_new_adapter_config(self, config: TimeLoraConfig) -> None:
         """

@@ -38,6 +38,7 @@ class TimeLoraLayer(BaseTunerLayer):
     adapter_layer_names = (
         "timelora_A",
         "timelora_B",
+        "timelora_time_mlp",
     )
     # All names of other parameters that may contain adapter-related parameters
     other_param_names = (
@@ -46,8 +47,6 @@ class TimeLoraLayer(BaseTunerLayer):
         "scaling",
         "lora_dropout",
         "time_embedding_dim",
-        "timelora_time_encoder_A",
-        "timelora_time_encoder_B",
     )
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
@@ -63,10 +62,7 @@ class TimeLoraLayer(BaseTunerLayer):
         self.timelora_B = nn.ParameterDict({})
         
         # Time encoders: map scalar t -> embedding vector
-        # timelora_time_encoder_A: (1) -> (time_embedding_dim, in_features)
-        # timelora_time_encoder_B: (1) -> (out_features, time_embedding_dim)
-        self.timelora_time_encoder_A = nn.ModuleDict({})
-        self.timelora_time_encoder_B = nn.ModuleDict({})
+        self.timelora_time_mlp = nn.ModuleDict({})
         
         # Mark the weight as unmerged
         self._disable_adapters = False
@@ -126,21 +122,17 @@ class TimeLoraLayer(BaseTunerLayer):
         self.timelora_B[adapter_name] = nn.Parameter(torch.empty(self.out_features, r))
         
         # Time encoders: lightweight MLPs to map t (scalar) to embedding matrices
-        # For A: t -> (time_embedding_dim * in_features)
+        # t -> (time_embedding_dim * in_features)
         time_hidden_dim = 64  # Hidden dimension for time MLP
         dtype = torch.bfloat16 if dtype == "bf16" else torch.float32
-        self.timelora_time_encoder_A[adapter_name] = nn.Sequential(
+        self.timelora_time_mlp[adapter_name] = nn.Sequential(
             nn.Linear(1, time_hidden_dim, dtype=dtype),
             nn.SiLU(),  # Smooth activation like in diffusion models
-            nn.Linear(time_hidden_dim, time_embedding_dim * self.in_features, dtype=dtype),
+            nn.Linear(time_hidden_dim, time_hidden_dim, dtype=dtype),
+            nn.SiLU(),
+            nn.Linear(time_hidden_dim, r, dtype=dtype),
         )
         
-        # For B: t -> (out_features * time_embedding_dim)
-        self.timelora_time_encoder_B[adapter_name] = nn.Sequential(
-            nn.Linear(1, time_hidden_dim, dtype=dtype),
-            nn.SiLU(),
-            nn.Linear(time_hidden_dim, self.out_features * time_embedding_dim, dtype=dtype),
-        )
         
         # Initialize weights
         self.reset_timelora_parameters(adapter_name, init_lora_weights)
@@ -161,21 +153,17 @@ class TimeLoraLayer(BaseTunerLayer):
             nn.init.zeros_(self.timelora_B[adapter_name])
             
             # Initialize time encoders with small weights (start with minimal time influence)
-            for module in self.timelora_time_encoder_A[adapter_name]:
+            for module in self.timelora_time_mlp[adapter_name]:
                 if isinstance(module, nn.Linear):
                     nn.init.normal_(module.weight, std=0.01)
                     nn.init.zeros_(module.bias)
-            
-            for module in self.timelora_time_encoder_B[adapter_name]:
-                if isinstance(module, nn.Linear):
-                    nn.init.normal_(module.weight, std=0.01)
-                    nn.init.zeros_(module.bias)
+        
         else:
             # Random initialization for debugging
             nn.init.kaiming_uniform_(self.timelora_A[adapter_name], a=math.sqrt(5))
             nn.init.kaiming_uniform_(self.timelora_B[adapter_name], a=math.sqrt(5))
             
-            for module in self.timelora_time_encoder_A[adapter_name]:
+            for module in self.timelora_time_mlp[adapter_name]:
                 if isinstance(module, nn.Linear):
                     nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
             
@@ -210,7 +198,7 @@ class TimeLoraLayer(BaseTunerLayer):
                     layer.requires_grad_(False)
 
         # Handle time encoders separately (they are nn.Sequential modules, not parameters)
-        for encoder_name in ["timelora_time_encoder_A", "timelora_time_encoder_B"]:
+        for encoder_name in ["timelora_time_mlp"]:
             if hasattr(self, encoder_name):
                 encoder_dict = getattr(self, encoder_name)
                 for key, encoder in encoder_dict.items():
@@ -418,11 +406,9 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
         """
         # Extract timestep: Priority kwargs > model storage > None
         timestep = kwargs.pop('timestep', None)
-        if timestep is None and hasattr(self, '_timelora_model') and self._timelora_model is not None:
-            timestep = getattr(self._timelora_model, '_timestep_storage', None)
+        kwargs = {}
         
         print("[DEBUG] timestep=", timestep)
-        breakpoint()
         result = self.base_layer(x, *args, **kwargs)
         
         if self.disable_adapters:
@@ -455,50 +441,23 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
                     t = t.view(1, 1).expand(x.shape[0], 1)
                 elif t.dim() == 1:
                     t = t.unsqueeze(-1)
-                t = t.to(x.device, dtype=x.dtype)
+                t = t.to(x.device)
             # Generate time embeddings for the batch
-            time_emb_A = self.timelora_time_encoder_A[active_adapter](t).to(x.dtype)  # (batch_size, time_embedding_dim * in_features)
-            time_emb_A = time_emb_A.view(t.shape[0], self.time_embedding_dim[active_adapter], self.in_features)  # (batch_size, time_embedding_dim, in_features)
+            time_embedding = self.timelora_time_mlp[active_adapter](t).to(x.dtype)  # (batch_size, r)
             
-            time_emb_B = self.timelora_time_encoder_B[active_adapter](t).to(x.dtype)  # (batch_size, out_features * time_embedding_dim)
-            time_emb_B = time_emb_B.view(t.shape[0], self.out_features, self.time_embedding_dim[active_adapter])  # (batch_size, out_features, time_embedding_dim)
-            
-            # Expand A and B for batch dimension
-            A_expanded = A.unsqueeze(0).expand(t.shape[0], -1, -1)  # (batch_size, r, in_features)
-            B_expanded = B.unsqueeze(0).expand(t.shape[0], -1, -1)  # (batch_size, out_features, r)
-            
-            # Concatenate to form full matrices per sample
-            A_full = torch.cat([A_expanded, time_emb_A], dim=1)  # (batch_size, r+time_embedding_dim, in_features)
-            B_full = torch.cat([B_expanded, time_emb_B], dim=2)  # (batch_size, out_features, r+time_embedding_dim)
-            
+            breakpoint()
             # Apply dropout
             x_dropped = self.lora_dropout[active_adapter](x)  # (batch_size, ..., in_features)
             
-            # Reshape for batch matrix multiplication
-            original_shape = x_dropped.shape
-            if x_dropped.dim() > 2:
-                # Flatten all dimensions except last
-                x_dropped = x_dropped.view(-1, self.in_features)  # (batch_size * seq_len, in_features)
-                # Expand A_full and B_full to match
-                A_full = A_full.repeat_interleave(original_shape[1] if len(original_shape) > 2 else 1, dim=0)
-                B_full = B_full.repeat_interleave(original_shape[1] if len(original_shape) > 2 else 1, dim=0)
-            
             # Compute: (x @ A_full.T @ B_full.T) * scaling
-            # (batch_size * seq_len, in_features) @ (batch_size * seq_len, in_features, r+time_embedding_dim)
-            lora_out = torch.bmm(
-                x_dropped.unsqueeze(1),  # (batch_size * seq_len, 1, in_features)
-                A_full.transpose(1, 2)   # (batch_size * seq_len, in_features, r+time_embedding_dim)
-            )  # (batch_size * seq_len, 1, r+time_embedding_dim)
+            # (batch_size, seq_len, in_features) @ (batch_size * seq_len, in_features, r+time_embedding_dim)
+            xA = torch.einsum('bsd,rd->bsr', x_dropped, A.to(x_dropped.dtype))
+            # Then scale xA using time_embedding
+            scaled_xA = xA * time_embedding.unsqueeze(1)
+
+            scaled_xAB = torch.einsum('bsr,or->bso', scaled_xA, B.to(x_dropped.dtype))
             
-            lora_out = torch.bmm(
-                lora_out,  # (batch_size * seq_len, 1, r+time_embedding_dim)
-                B_full.transpose(1, 2)  # (batch_size * seq_len, r+time_embedding_dim, out_features)
-            ).squeeze(1)  # (batch_size * seq_len, out_features)
             
-            # Reshape back if needed
-            if len(original_shape) > 2:
-                lora_out = lora_out.view(*original_shape[:-1], self.out_features)
-            
-            result = result + lora_out * self.scaling[active_adapter]
+            result = result + scaled_xAB * self.scaling[active_adapter]
         
         return result
