@@ -408,13 +408,12 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
         timestep = kwargs.pop('timestep', None)
         kwargs = {}
         
-        print("[DEBUG] timestep=", timestep)
         result = self.base_layer(x, *args, **kwargs)
         
         if self.disable_adapters:
             return result
         
-        print("[DEBUG] Processing TimeLora with timestep:", timestep)
+        # print("[DEBUG] Processing TimeLora with timestep:", timestep)
         
         # Apply TimeLora adaptations
         for active_adapter in self.active_adapters:
@@ -429,11 +428,11 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
             if timestep is None:
                 # Default to t=0 for all samples
                 batch_size = x.shape[0]
-                t = torch.ones(batch_size, 1, device=x.device, dtype=x.dtype)
+                t = torch.ones(batch_size, 1, device=x.device)
             elif isinstance(timestep, (int, float)):
                 # Scalar: broadcast to all samples
                 batch_size = x.shape[0]
-                t = torch.full((batch_size, 1), timestep, device=x.device, dtype=x.dtype)
+                t = torch.full((batch_size, 1), timestep, device=x.device)
             else:
                 # Tensor: ensure shape (batch_size, 1)
                 t = timestep
@@ -443,9 +442,9 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
                     t = t.unsqueeze(-1)
                 t = t.to(x.device)
             # Generate time embeddings for the batch
-            time_embedding = self.timelora_time_mlp[active_adapter](t).to(x.dtype)  # (batch_size, r)
-            
-            breakpoint()
+            temp_dtype = self.timelora_time_mlp[active_adapter][0].weight.dtype
+            time_embedding = self.timelora_time_mlp[active_adapter](t.to(temp_dtype)).to(x.dtype)  # (batch_size, r)
+            # print("[DEBUG] Time embedding dtype:", self.timelora_time_mlp[active_adapter][0].weight.dtype)
             # Apply dropout
             x_dropped = self.lora_dropout[active_adapter](x)  # (batch_size, ..., in_features)
             
