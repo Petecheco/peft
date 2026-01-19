@@ -389,6 +389,10 @@ def _insert_adapter_name_into_state_dict(
     peft_model_state_dict = {}
     for key, val in state_dict.items():
         if parameter_prefix in key:
+            # This is needed for nn.Sequential adapter (SB-LoRA)
+            if f".{adapter_name}." in key or key.endswith(f".{adapter_name}"):
+                peft_model_state_dict[key] = val
+                continue
             _, _, suffix = key.rpartition(parameter_prefix)
             if "." in suffix:
                 suffix_to_replace = ".".join(suffix.split(".")[1:])

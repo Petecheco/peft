@@ -583,6 +583,7 @@ class BaseTuner(nn.Module, ABC):
         progressbar: bool = False,
         safe_merge: bool = False,
         adapter_names: Optional[list[str]] = None,
+        **kwargs,
     ) -> None:
         if merge:
             self._check_merge_allowed()
@@ -603,13 +604,14 @@ class BaseTuner(nn.Module, ABC):
                     self._replace_module(parent, target_name, unloaded_module, target)
                 elif hasattr(target, "base_layer"):
                     if merge:
-                        target.merge(safe_merge=safe_merge, adapter_names=adapter_names)
+                        print(f"Merging {key}")
+                        target.merge(safe_merge=safe_merge, adapter_names=adapter_names,**kwargs)
                     self._replace_module(parent, target_name, target.get_base_layer(), target)
 
         return self.model
 
     def merge_and_unload(
-        self, progressbar: bool = False, safe_merge: bool = False, adapter_names: Optional[list[str]] = None
+        self, progressbar: bool = False, safe_merge: bool = False, adapter_names: Optional[list[str]] = None, **kwargs
     ) -> torch.nn.Module:
         r"""
         This method merges the adapter layers into the base model.
@@ -643,7 +645,7 @@ class BaseTuner(nn.Module, ABC):
         ```
         """
         return self._unload_and_optionally_merge(
-            progressbar=progressbar, safe_merge=safe_merge, adapter_names=adapter_names
+            progressbar=progressbar, safe_merge=safe_merge, adapter_names=adapter_names, **kwargs
         )
 
     def unload(self) -> torch.nn.Module:

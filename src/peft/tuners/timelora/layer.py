@@ -166,10 +166,6 @@ class TimeLoraLayer(BaseTunerLayer):
             for module in self.timelora_time_mlp[adapter_name]:
                 if isinstance(module, nn.Linear):
                     nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
-            
-            for module in self.timelora_time_encoder_B[adapter_name]:
-                if isinstance(module, nn.Linear):
-                    nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
 
     def set_adapter(self, adapter_names: str | list[str], inference_mode: bool = False) -> None:
         """Set the active adapter(s).
@@ -232,9 +228,9 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
         super().__init__()
         TimeLoraLayer.__init__(self, base_layer, **kwargs)
         self._active_adapter = adapter_name
-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, time_embedding_dim, init_lora_weights,dtype)
+        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, time_embedding_dim, init_lora_weights, dtype=dtype)
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None, merge_timestep: Optional[float] = None) -> None:
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None, **kwargs) -> None:
         """
         Merge the active adapter weights into the base weights.
         
@@ -256,6 +252,7 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
                 The timestep to use for merging. If None, only static LoRA weights are merged and time encoders
                 remain active. If provided, the full time-dependent weights at this timestep are merged.
         """
+        merge_timestep = kwargs.get("merge_timestep", None)
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
             return
@@ -337,17 +334,13 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
 
     def get_delta_weight(self, adapter: str, timestep: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Compute the delta weight for the given adapter.
+        Compute the delta weight for the given adapter using FiLM logic.
         
-        This concatenates the time embeddings (computed from timestep) to the LoRA matrices:
-        A_full = [timelora_A; time_embedding_A(t)]  # Shape: (r+time_embedding_dim, in_features)
-        B_full = [timelora_B, time_embedding_B(t)]  # Shape: (out_features, r+time_embedding_dim)
-        
-        Delta = B_full @ A_full * scaling
+        Delta = (B * time_embedding) @ A * scaling
         
         Args:
             adapter: Name of the adapter
-            timestep: Time value(s), shape (batch_size, 1) or scalar. If None, uses t=0.
+            timestep: Time value(s), shape (batch_size, 1) or scalar. If None, uses t=1.0.
         """
         # Get the matrices
         A = self.timelora_A[adapter]  # (r, in_features)
@@ -355,31 +348,28 @@ class TimeLoraLinear(nn.Module, TimeLoraLayer):
         
         # Handle timestep
         if timestep is None:
-            # Default to t=0
-            timestep = torch.ones(1, 1, device=A.device, dtype=A.dtype)
+            # Default to t=1.0
+            timestep = torch.ones(1, 1, device=A.device)
         elif timestep.dim() == 0:
             # Scalar -> (1, 1)
-            timestep = timestep.view(1, 1).to(A.device, dtype=A.dtype)
+            timestep = timestep.view(1, 1).to(A.device)
         elif timestep.dim() == 1:
             # (batch_size,) -> (batch_size, 1)
-            timestep = timestep.unsqueeze(-1).to(A.device, dtype=A.dtype)
+            timestep = timestep.unsqueeze(-1).to(A.device)
         
-        # Encode time: for merge, we use the first timestep (or mean)
+        # Encode time: for a static delta weight, we use the first timestep in the batch
         t_input = timestep[:1]  # (1, 1)
         
         # Generate time embeddings
-        time_emb_A = self.timelora_time_encoder_A[adapter](t_input)  # (1, time_embedding_dim * in_features)
-        time_emb_A = time_emb_A.view(self.time_embedding_dim[adapter], self.in_features)  # (time_embedding_dim, in_features)
+        # Ensure timestep is in the correct dtype for the MLP
+        temp_dtype = self.timelora_time_mlp[adapter][0].weight.dtype
+        time_embedding = self.timelora_time_mlp[adapter](t_input.to(temp_dtype)).to(A.dtype)  # (1, r)
         
-        time_emb_B = self.timelora_time_encoder_B[adapter](t_input)  # (1, out_features * time_embedding_dim)
-        time_emb_B = time_emb_B.view(self.out_features, self.time_embedding_dim[adapter])  # (out_features, time_embedding_dim)
-        
-        # Concatenate time embeddings
-        A_full = torch.cat([A, time_emb_A], dim=0)  # (r+time_embedding_dim, in_features)
-        B_full = torch.cat([B, time_emb_B], dim=1)  # (out_features, r+time_embedding_dim)
-        
-        # Compute delta
-        delta_weight = B_full @ A_full * self.scaling[adapter]
+        # Compute delta: (B * time_embedding) @ A
+        # In FiLM, time_embedding scales the bottleneck output: (x @ A.T) * time_embedding @ B.T
+        # This is equivalent to scaling the columns of B (if we consider B as (out, r))
+        # B: (out, r), time_embedding: (1, r) -> broadcasted multiplication scales each column of B
+        delta_weight = (B * time_embedding) @ A * self.scaling[adapter]
         
         return delta_weight
 
